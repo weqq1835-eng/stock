@@ -1,0 +1,165 @@
+import streamlit as st
+import akshare as ak
+import pandas as pd
+import datetime
+import time
+
+# Streamlit 頁面配置（寬屏、手機友好）
+st.set_page_config(page_title="中國A股熱門人氣股監控App", layout="wide")
+st.title("🔥 中國A股熱門人氣個股監控系統")
+st.markdown("""
+**功能說明**：
+- 實時監控熱門人氣股票（高換手率 + 資金活躍）
+- 檢測顯性主力資金流入/流出
+- 檢測潛在「拆單/暗池」隱藏買入（主力大單拆小單吸籌）
+- 提供簡單入場/出場時機提示（僅供參考，基於資金流邏輯）
+- 數據來源：東方財富/akshare（交易日9:30-15:00實時，非交易日數據靜止）
+
+**警告**：本工具僅供學習參考，非投資建議！股市有風險，所有信號均有滯後與噪音，請結合基本面、技術面自行判斷。
+""")
+
+# 側邊欄參數調整
+st.sidebar.header("監控參數調整（可自訂）")
+REFRESH_INTERVAL = st.sidebar.slider("自動刷新間隔（秒）", 60, 600, 300, help="建議300秒以上，避免請求過頻")
+HIDDEN_BUY_THRESHOLD = st.sidebar.number_input("暗池買入閾值（小單淨流入，萬元）", value=5000, help="越高越嚴格")
+VISIBLE_SELL_THRESHOLD = st.sidebar.number_input("顯性主力流出閾值（萬元）", value=-2000, help="負值表示主力顯性賣出")
+HOT_TURNOVER = st.sidebar.number_input("熱門人氣換手率下限（%）", value=5.0, help="換手率越高越熱門")
+TOP_N = st.sidebar.slider("顯示前N名", 10, 50, 20)
+
+# 數據獲取函數
+@st.cache_data(ttl=REFRESH_INTERVAL)  # 緩存數據，避免重複請求
+def get_all_data():
+    with st.spinner("正在下載全市場實時數據（約5000+股票），請稍等10-30秒..."):
+        df = ak.stock_zh_a_spot_em()
+        # 欄位清理
+        fund_cols = ['主力淨流入-淨額', '超大單淨流入-淨額', '大單淨流入-淨額', 
+                     '中單淨流入-淨額', '小單淨流入-淨額']
+        for col in fund_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+        df['顯性主力淨流入'] = df.get('超大單淨流入-淨額', 0) + df.get('大單淨流入-淨額', 0)
+        df['漲跌幅'] = pd.to_numeric(df['漲跌幅'], errors='coerce').fillna(0)
+        df['換手率'] = pd.to_numeric(df['換手率'], errors='coerce').fillna(0)
+        df['總市值'] = pd.to_numeric(df['總市值'], errors='coerce').fillna(0)
+        
+        # 過濾：排除ST、退市、小市值、低活躍
+        df = df[~df['名稱'].str.contains('ST|退|*', na=False)]
+        df = df[df['總市值'] > 3e9]  # 30億以上
+        
+        return df
+
+# 信號判斷函數
+def generate_signal(row):
+    visible = row['顯性主力淨流入']
+    hidden = row['小單淨流入-淨額']
+    turnover = row['換手率']
+    change = row['漲跌幅']
+    
+    signals = []
+    if visible > 1e7:  # 顯性主力強流入 >1億
+        signals.append("🟢 顯性主力強買，熱門吸籌")
+    if visible < -5e6 and change < 0:  # 主力流出 + 股價跌
+        signals.append("🔴 主力出貨，注意出場風險")
+    
+    if (visible < VISIBLE_SELL_THRESHOLD * 1e4 and 
+        hidden > HIDDEN_BUY_THRESHOLD * 1e4 and 
+        change >= -1 and turnover > 3):  # 暗池條件
+        signals.append("🟡 潛在暗池拆單強買，吸籌階段（考慮低位入場）")
+    
+    if turnover > HOT_TURNOVER and change > 5:
+        signals.append("⚡ 超高人氣，短期熱門")
+    
+    if not signals:
+        return "⚪ 無明顯信號"
+    return " | ".join(signals)
+
+# 主邏輯
+df = get_all_data()
+
+# 熱門人氣篩選：換手率高 + 有資金活躍
+hot_df = df[df['換手率'] > HOT_TURNOVER].copy()
+
+# 顯性主力熱門榜
+visible_hot = hot_df[hot_df['顯性主力淨流入'] > 0].sort_values(by='顯性主力淨流入', ascending=False).head(TOP_N)
+
+# 暗池拆單熱門榜
+hidden_hot = hot_df[
+    (hot_df['顯性主力淨流入'] < VISIBLE_SELL_THRESHOLD * 1e4) &
+    (hot_df['小單淨流入-淨額'] > HIDDEN_BUY_THRESHOLD * 1e4) &
+    (hot_df['漲跌幅'] >= -2)
+].sort_values(by='小單淨流入-淨額', ascending=False).head(TOP_N)
+
+# 添加信號
+if not visible_hot.empty:
+    visible_hot['信號提示'] = visible_hot.apply(generate_signal, axis=1)
+if not hidden_hot.empty:
+    hidden_hot['信號提示'] = hidden_hot.apply(generate_signal, axis=1)
+
+# 格式化金額（億元）
+def format_money(df):
+    money_cols = ['顯性主力淨流入', '小單淨流入-淨額', '主力淨流入-淨額', '總市值']
+    for col in money_cols:
+        如果山口在 df.columns:
+            df[f'{col}（億元）'] = (df[col] /1e8).round(2)
+返回df
+
+# 顯示結果
+col1, col2 = st.columns(2)
+
+与1：
+    st.subheader(f"熱門顯性主力流入榜（biocom{TOP_N}）)
+    如果 visible_hot.empty:
+        st.info("當前無符合條件的熱門顯性主力流入股票")
+    其他的:
+display_cols = ['代碼', '名稱', '最新價', '漲跌幅', '換手率', 
+                        '顯性主力淨流入(億元)', '小單淨流入-淨額(億元)', '總市值(億元)', '信號提示']
+display_cols = [c为C在 display_cols 如果C在 format_money(visible_hot).columns]
+st.dataframe(format_money(visible_hot)[display_cols], use_container_width=True)
+
+与co2：
+    st.subheader(f"️熱門潛在暗池/你怎么看（{TOP_N}）)
+如果 hidden_hot.empty：
+        st.info("當前無符合條件的熱門暗池買入股票")
+其他的:
+display_cols = ['代碼', '名稱', '最新價', '漲跌幅', '換手率', 
+                        '顯性主力淨流入(億元)', '小單淨流入-淨額(億元)', '估計暗池流入(億元)', '總市值(億元)', '信號提示']
+        hidden_hot['估計暗池流入(億元)'] = (hidden_hot['小單淨流入-淨額'] /1e8).round(2)
+display_cols=[C为 C display_cols you made_money(hidden_hot)
+        st.dataframe(format_money(hidden_hot)[display_cols], use_container_width=True)
+
+# 個股查詢功能
+st.sidebar.header("個股資金查詢")
+stock_code = st.sidebar.text_input("輸入股票代碼（如600519）或名稱關鍵字")
+如果 stock_code:
+search_df = df[df['代碼'].str.contains(stock_code) | df['名稱'].str.contains(stock_code)]
+如果 not search_df
+        st.subheader(f"個股資金詳情：{search_df.iloc[0]['mayoto']}（{search_df.iloc[0]['brioto']}）
+        row = search_df.iloc[0]
+st.dataframe(format_money(hidden_hot)[display_cols], use_container_width=True)
+# 個股查詢功能
+st.sidebar.header（[個股資金查詢]）
+stock_code=st. sidebar. text_input（"輸入股票代碼（600519）you joryou willoyou）
+其他的:
+如果股票_you：
+
+search_df=df[df['代碼'].str.contains（stock_code）|df['''str.contains（stock_code）]
+如果不是 search_df.empty：
+st.子标题（f"you weboto:{search_df. iloc[0]'）））'mayoto']}（{search_df. iloc[0]']}）"
+    st.rerun()
+
+row = search_df.iloc[0]
+st.markdown("---")
+st. write f最新價：{##''}％|{行[''']}％"）
+st.code("""
+st.write顯性主力淨流入：{[mayou you]/18：）
+st.write（f"小單淨流入 yousyou mayoto mayou）：{row.get（''''''youmoviowemoto-'1,0）
+
+st.write（f"**信號提示**：{generate_signal（row）}"）
+
+错误（[****]）
+# 自動刷新提示
+
+标记"最後更新時間：{datetime.datetime.now（）
+""")
+st.markdown(如果圣侧边栏)
